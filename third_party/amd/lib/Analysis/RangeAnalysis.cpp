@@ -66,7 +66,7 @@ namespace tt = mlir::triton;
 namespace {
 
 constexpr int64_t kDefaultMaxTripCount = 1024;
-constexpr uint64_t kDefaultMaxPrograms = 1L << 31; // 2147483648
+constexpr uint64_t kDefaultMaxPrograms = 1ULL << 31; // 2147483648
 
 void getEnclosingLoops(Operation &op, SmallVector<LoopLikeOpInterface> &ops) {
   Operation *currOp = op.getParentOp();
@@ -720,12 +720,13 @@ void TritonIntegerRangeAnalysis::visitRegionSuccessors(
       if (!point->isBlockStart()) {
         if (!inputs.empty())
           firstIndex = cast<OpResult>(inputs.front()).getResultNumber();
+        RegionSuccessor parentSuccessor(branch.getOperation());
         SmallVector<Value> nonSuccessorInputs =
-            branch.getNonSuccessorInputs(RegionSuccessor::parent());
+            branch.getNonSuccessorInputs(parentSuccessor);
         SmallVector<dataflow::IntegerValueRangeLattice *>
             nonSuccessorInputLattices =
                 llvm::map_to_vector(nonSuccessorInputs, valueToLattices);
-        visitNonControlFlowArguments(branch, RegionSuccessor::parent(),
+        visitNonControlFlowArguments(branch, parentSuccessor,
                                      nonSuccessorInputs,
                                      nonSuccessorInputLattices);
       } else {

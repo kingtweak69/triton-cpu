@@ -25,12 +25,28 @@ def is_pingpong_schedule_enabled(arch, use_async_copy):
 
 
 def is_in_thread_transpose_enabled(arch):
-    return (arch == "gfx942" or "gfx110" in arch or "gfx115" in arch or "gfx120" in arch) \
+    return (arch == "gfx942" or "gfx110" in arch or "gfx115" in arch or "gfx117" in arch or "gfx120" in arch) \
         if knobs.amd.use_in_thread_transpose is None else knobs.amd.use_in_thread_transpose
 
 
 def is_async_copy_enabled(arch):
     return (arch in ["gfx950", "gfx1250"]) if knobs.amd.use_async_copy is None else knobs.amd.use_async_copy
+
+
+def is_coexec_scheduler_supported(arch):
+    return arch in ["gfx1250"]
+
+
+def is_coexec_scheduler_enabled(arch):
+    if knobs.amd.use_coexec_scheduler is not None:
+        return knobs.amd.use_coexec_scheduler
+    return arch in ["gfx1250"]
+
+
+def is_expert_scheduling_enabled(arch):
+    if knobs.amd.use_expert_scheduling is not None:
+        return knobs.amd.use_expert_scheduling
+    return arch in ["gfx1250"]
 
 
 def is_fpsan_supported(arch):
@@ -85,6 +101,7 @@ class HIPOptions:
     max_num_imprecise_acc_default: int = 0
     backend_name: str = 'hip'
     instrumentation_mode: str = ""
+    fpsan_homomorphic_casts: bool = False
 
     # The following option provides hints to the AMDGPU backend regarding instruction scheduling
     # for all `tt.dot` operations in a kernel. Experimental; right now no effect.
@@ -301,14 +318,10 @@ class HIPBackend(BaseBackend):
         amd.passes.ttgpuir.add_prepare_if_combining(pm)
         passes.common.add_canonicalizer(pm)
         passes.common.add_cse(pm)
-        if knobs.amd.use_buffer_ops:
-            # Run after CSE so matching assume and loop-bound expressions
-            # share SSA, letting range analysis prove both non-negative.
-            amd.passes.ttgpuir.add_annotate_buffer_op_split_safety(pm)
         passes.common.add_symbol_dce(pm)
         if options.instrumentation_mode == "fpsan" and is_fpsan_supported(options.arch):
             amd.passes.ttgpuir.add_fp_sanitizer(pm)
-            passes.ttgpuir.add_fp_sanitizer(pm)
+            passes.ttgpuir.add_fp_sanitizer(pm, options.fpsan_homomorphic_casts)
         pm.run(mod, 'make_ttgir')
         metadata["tensordesc_meta"] = mod.get_tensordesc_metadata()
         return mod
@@ -331,9 +344,7 @@ class HIPBackend(BaseBackend):
 
         if options.instrumentation_mode == "fpsan" and is_fpsan_supported(options.arch):
             amd.passes.ttgpuir.add_fp_sanitizer(pm)
-            passes.ttgpuir.add_fp_sanitizer(pm)
-
-        amd.passes.ttgpuir.add_annotate_buffer_op_split_safety(pm)
+            passes.ttgpuir.add_fp_sanitizer(pm, options.fpsan_homomorphic_casts)
 
         pm.run(mod, 'gluon_to_ttgir')
         metadata["tensordesc_meta"] = mod.get_tensordesc_metadata()
@@ -392,6 +403,8 @@ class HIPBackend(BaseBackend):
             passes.llvmir.add_di_scope(pm)
 
         amd.passes.ttgpuir.add_builtin_func_to_llvmir(pm, options.arch, __HIP_FTZ)
+        # Cleanup leftover unrealized_conversion_casts before converted to LLVM.
+        passes.convert.add_reconcile_unrealized_casts(pm)
         pm.run(mod, 'make_llir')
 
         if knobs.compilation.dump_ir_extract_di_local_variables:
@@ -439,6 +452,7 @@ class HIPBackend(BaseBackend):
         if not kernel_fn:
             raise RuntimeError("Could not find kernel function")
         kernel_fn.set_calling_conv(amd.CALLING_CONV_AMDGPU_KERNEL)
+
         cluster_dim = metadata["num_ctas"]
         kernel_fn.add_fn_attr("amdgpu-cluster-dims", f"{cluster_dim},1,1")
         # warp-specialization mutates num_warps
@@ -448,18 +462,20 @@ class HIPBackend(BaseBackend):
             total_warps_num = total_num_warps
         kernel_fn.add_fn_attr("amdgpu-flat-work-group-size", f"1,{total_warps_num*options.warp_size}")
         kernel_fn.add_fn_attr("uniform-work-group-size", "true")
-        # LLVM AMDGPU backend supports the attribute "amdgpu-waves-per-eu"="<min>[, <max>]".
-        # This attribute may be attached to a kernel function definition and is an optimization hint.
-        # <min> parameter specifies the requested minimum number of waves per EU, and optional <max> parameter
-        # specifies the requested maximum number of waves per EU (must be >= <min> if specified).
-        # If <max> is omitted, then there is no restriction on the maximum number of waves per EU other than
-        # the one dictated by the hardware for which the kernel is compiled. Passing 0, 0 as <min>, <max>
-        # implies the default behavior (no limits).
-        # Specifying N, N forces LLVM to focus on a single register count, simplifies some heuristics
-        # and may improve scheduling.
-        kernel_fn.add_fn_attr("amdgpu-waves-per-eu", f"{options.waves_per_eu}, {options.waves_per_eu}")
+        # "amdgpu-waves-per-eu"="<min>[,<max>]" allows controlling the minimal and (optional)
+        # maximal number of waves per SIMD. If <max> is omitted, then no restriction other than
+        # whatever allowed by the hardware for occupancy.
+        # Specifying "N,N" forces LLVM to focus on a single register budget, simplifies some
+        # heuristics and may improve scheduling.
+        if options.waves_per_eu != 0:
+            kernel_fn.add_fn_attr("amdgpu-waves-per-eu", f"{options.waves_per_eu},{options.waves_per_eu}")
+
+        if is_coexec_scheduler_enabled(options.arch) and options.num_warps <= 4:
+            kernel_fn.add_fn_attr("amdgpu-sched-strategy", "coexec")
+
         denormal_mode = "preserve-sign" if options.allow_flush_denorm else "ieee"
         kernel_fn.add_fn_attr("denormal-fp-math-f32", denormal_mode)
+
         if knobs.compilation.enable_asan:
             kernel_fn.add_fn_target_feature("+xnack")
             kernel_fn.add_fn_asan_attr()
@@ -489,7 +505,8 @@ class HIPBackend(BaseBackend):
             if len(paths) > 0:
                 llvm.link_extern_libs(llvm_mod, paths)
 
-        llvm.optimize_module(llvm_mod, llvm.OPTIMIZE_O3, options.arch, '', [], options.enable_fp_fusion)
+        llvm.optimize_module(llvm_mod, llvm.OPTIMIZE_O3, options.arch, '', [], options.enable_fp_fusion,
+                             disable_vector_combine=True)
 
         # Architectures with architected SGPRs store the workgroup id in ttmp9 (X) and ttmp7 (Y[15:0], Z[31:16]).
         # These attributes are used to determine if Z should be masked out when loading Y. They are inferred during
@@ -512,6 +529,9 @@ class HIPBackend(BaseBackend):
         metadata["profile_scratch_align"] = src.get_int_attr("ttg.profile_scratch_memory_alignment") or 1
 
         amd.cleanup_bitcode_metadata(llvm_mod)
+        # Add Triton and LLVM versions to the dumped IR.
+        if knobs.compilation.dump_ir:
+            llvm.add_version_info(llvm_mod)
         # Disable inlining of print related functions,
         # because inlining of these function could slow down compilation significantly
         amd.disable_print_inline(llvm_mod)
@@ -527,6 +547,8 @@ class HIPBackend(BaseBackend):
         metadata["name"] = names[0]
         # llvm -> hsaco
         flags = []
+        if is_expert_scheduling_enabled(options.arch):
+            flags.append("amdgpu-expert-scheduling-mode")
         features = disable_real_true16_feature(options.arch)
         ir_hash = hashlib.sha256(src.encode("utf-8")).hexdigest()
         dump_file_id = names[0] + '_' + ir_hash

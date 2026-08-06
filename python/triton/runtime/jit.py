@@ -189,7 +189,7 @@ class DependenciesFinder(ast.NodeVisitor):
         lhs_name = getattr(lhs, "__name__", "")
         if lhs is None or lhs_name in self.supported_modules:
             return None
-        ret = getattr(lhs, node.attr)
+        ret = getattr(lhs, node.attr, None)
         self.record_reference(ret)
         return ret
 
@@ -231,13 +231,17 @@ class DependenciesFinder(ast.NodeVisitor):
         visit_defaults(node.defaults)
 
     def visitAssnTarget(self, node):
-        # Target is either a single string, or a list of strings (if the assn
-        # target is a tuple).
+        # Target is either a single string, or a (possibly nested) list of strings if the assign target is a tuple.
         target = self.visit(node)
-        if isinstance(target, list):
-            self.local_names |= set(target)
-        else:
-            self.local_names.add(target)
+
+        def _add(t):
+            if isinstance(t, list):
+                for sub in t:
+                    _add(sub)
+            else:
+                self.local_names.add(t)
+
+        _add(target)
 
     def visit_Assign(self, node):
         if len(node.targets) != 1:
@@ -585,6 +589,19 @@ class JitFunctionInfo:
     jit_function: JITFunction
 
 
+def _replace_jit_callables(obj):
+    if isinstance(obj, list):
+        return [_replace_jit_callables(arg) for arg in obj]
+    elif is_namedtuple(obj):
+        results = [_replace_jit_callables(arg) for arg in obj]
+        return obj.__class__(*results)
+    elif isinstance(obj, tuple):
+        return tuple(_replace_jit_callables(arg) for arg in obj)
+    elif isinstance(obj, JITCallable):
+        return obj.cache_key
+    return obj
+
+
 def compute_cache_key(kernel_key_cache, specialization, options):
     key = (tuple(specialization), str(options))
     cache_key = kernel_key_cache.get(key, None)
@@ -592,19 +609,7 @@ def compute_cache_key(kernel_key_cache, specialization, options):
         return cache_key
 
     # Replace JITCallable objects with their hash, so the cache key will change if the src is updated
-    def replace_callables(obj):
-        if isinstance(obj, list):
-            return [replace_callables(arg) for arg in obj]
-        elif is_namedtuple(obj):
-            results = [replace_callables(arg) for arg in obj]
-            return obj.__class__(*results)
-        elif isinstance(obj, tuple):
-            return tuple(replace_callables(arg) for arg in obj)
-        elif isinstance(obj, JITCallable):
-            return obj.cache_key
-        return obj
-
-    cache_key = str(replace_callables(specialization)) + str(options)
+    cache_key = str(_replace_jit_callables(specialization)) + str(options)
     kernel_key_cache[key] = cache_key
     return cache_key
 
@@ -728,6 +733,7 @@ class JITFunction(JITCallable, KernelInterface[T]):
     def run(self, *args, grid, warmup, **kwargs):
         kwargs["debug"] = kwargs.get("debug", self.debug) or knobs.runtime.debug
         kwargs["instrumentation_mode"] = knobs.compilation.instrumentation_mode
+        kwargs["fpsan_homomorphic_casts"] = knobs.compilation.fpsan_homomorphic_casts
 
         # parse options
         device_key = get_device_key()

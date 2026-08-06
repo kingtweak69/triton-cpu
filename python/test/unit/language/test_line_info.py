@@ -244,6 +244,7 @@ def test_line_info_env(monkeypatch, status: str):
     kernel_info = kernel_single.warmup(torch.float32, torch.float32, BLOCK=shape[0], grid=(1, ))
     file_lines = extract_file_lines(command, anchor, separator, kernel_info.asm[obj_kind])
     assert len(file_lines) == 0 if status == "1" else len(file_lines) > 0
+    kernel_single.device_caches.clear()
 
 
 @pytest.mark.parametrize("status", ["ttir", ""])
@@ -476,7 +477,7 @@ def test_use_name_loc_as_prefix(fresh_triton_cache):
         # CHECK: %[[COND:.*]] = arith.cmpi slt, %ivar_[[IV1]], %N : i32
         # CHECK: scf.condition(%[[COND]]) %arange_[[AR0]], %ivar_[[IV1]] : tensor<16xi32>, i32
         while ivar < N:
-            # CHECK: ^bb0(%arange_[[AR0]]: tensor<16xi32> loc("arange"), %ivar_[[IV1]]: i32
+            # CHECK: ^bb0(%arange_[[AR0]]: tensor<16xi32> loc("arange"(#{{.*}})), %ivar_[[IV1]]: i32
 
             # CHECK: %ivar_[[IV2:.+]] = arith.addi %ivar_[[IV1]], %c1_i32 : i32
             ivar += 1
@@ -582,6 +583,27 @@ def test_line_and_column_numbers(fresh_triton_cache):
         MASK_LINE="mask = offsets",
         STORE_LINE="tl.store",
     )
+    run_filecheck("placeholder", h.asm["ttir"], check_template)
+
+
+def test_while_block_arg_carries_init_handle_loc(fresh_triton_cache):
+
+    @triton.jit
+    def kernel_while_block_arg_loc(N):
+        # CHECK-LABEL: tt.func public @kernel_while_block_arg_loc
+        # CHECK: %ivar = arith.constant 0 : i32 loc(#[[INIT_IVAR_LOC:loc[0-9]+]])
+        # CHECK: %arange = tt.make_range {{.*}} loc(#[[INIT_ARANGE_LOC:loc[0-9]+]])
+        arange = tl.arange(0, 16)
+        ivar = 0
+        # CHECK: scf.while (%arange_{{.+}} = %arange, %ivar_{{.+}} = %ivar)
+        while ivar < N:
+            # CHECK: ^bb0(%arange_{{.+}}: tensor<16xi32> loc("arange"(#[[INIT_ARANGE_LOC]])), %ivar_{{.+}}: i32 loc("ivar"(#[[INIT_IVAR_LOC]])))
+            ivar += 1
+            arange *= ivar
+        tl.device_print("", arange)
+
+    h = triton.compile(triton.compiler.ASTSource(fn=kernel_while_block_arg_loc, signature={"N": "i32"}, constexprs={}))
+    check_template = inspect.getsource(kernel_while_block_arg_loc.fn)
     run_filecheck("placeholder", h.asm["ttir"], check_template)
 
 

@@ -17,7 +17,7 @@ from triton_kernels.numerics_details.flexpoint import (
     compute_scale,
 )
 from triton_kernels.numerics_details.mxfp_details._downcast_to_mxfp import MXFP_BLOCK_SIZE, NVFP_BLOCK_SIZE
-from triton_kernels.numerics_details.mxfp_details._upcast_from_mxfp import upcast_mxfp4_tile
+from triton_kernels.numerics_details.mxfp_details._upcast_from_mxfp import upcast_mxfp4_tile, upcast_nvfp4_tile
 from triton_kernels.tensor_details.layout_details.hopper_scale import unswizzle_mxfp4_scale_hopper
 from triton_kernels.tensor_details.layout_details.hopper_value import mxfp4_to_bf16_triton
 from ._common import (
@@ -66,9 +66,11 @@ def _p_matmul(
              X, XPtr, stride_x_z, stride_x_m, stride_x_k, X_TRANSPOSE: tl.constexpr,
              XScale,
              XMxScale, stride_x_mx_z, stride_x_mx_m, stride_x_mx_k,
+             XTensorScale, stride_x_tensor_scale_z, stride_x_tensor_scale_m,
              W, WPtr, stride_w_e, stride_w_k, stride_w_n, W_TRANSPOSE: tl.constexpr,
              WScale,
              WMxScale, stride_w_mx_e, stride_w_mx_k, stride_w_mx_n,
+             WTensorScale, stride_w_tensor_scale_e, stride_w_tensor_scale_n,
              OutAcc, stride_acc_z, stride_acc_m, stride_acc_n,
              OutAccScale, Y_ACC_IS_Y: tl.constexpr,
              B, stride_b_e, # Bias
@@ -118,6 +120,7 @@ def _p_matmul(
              SWAP_XW: tl.constexpr = False,
              IS_EPILOGUE_QUANT_MX: tl.constexpr = False,
              Y_VALUE_PACK_FACTOR: tl.constexpr = 1,
+             CLC: tl.constexpr = False,
              FLATTEN_LOOPS: tl.constexpr = True,
              W_SHUFFLED: tl.constexpr = False,
              pYPtrs=None,
@@ -132,6 +135,7 @@ def _p_matmul(
     if Y_TMA_MODE is not None:
         Y = tl.make_tensor_descriptor(YPtr, Y.shape, Y.strides[:-1] + (1,), Y.block_shape)
 
+    x_type: tl.constexpr = get_dtype(X)
     w_type: tl.constexpr = get_dtype(W)
     is_w_microscaled: tl.constexpr = WMxScale is not None
     is_x_microscaled: tl.constexpr = XMxScale is not None
@@ -185,7 +189,6 @@ def _p_matmul(
         PACKED_BLOCK_N_W: tl.constexpr = BLOCK_N
         tl.static_assert(SWIZZLE_MX_SCALE == "STRIDED")
     if is_x_microscaled:
-        x_type: tl.constexpr = get_dtype(X)
         is_x_fp4: tl.constexpr = x_type == tl.uint8
         tl.static_assert(x_type == tl.float8e4nv or x_type == tl.uint8, "mx_act_ptr must be float8e4nv or uint8")
         # NOTE: uint8 scale means OCP E8M0 here. Direct NVFP-style scales stay float8e4nv.
@@ -243,13 +246,18 @@ def _p_matmul(
 
     DISALLOW_ACC_MULTI_BUFFER: tl.constexpr = is_w_microscaled and BLOCK_M * BLOCK_N >= 128 * 256
 
+    loop_start = 0 if CLC else tl.program_id(0)
+    loop_end = 1 if CLC else num_blocks
+    loop_step = 1 if CLC else NUM_SMS
     for block_id in tl.range(
-        tl.program_id(0), num_blocks, NUM_SMS,
-        flatten=FLATTEN_LOOPS,
+        loop_start, loop_end, loop_step,
+        flatten=FLATTEN_LOOPS and not CLC,
         disallow_acc_multi_buffer=DISALLOW_ACC_MULTI_BUFFER,
         # Workaround for compile error in hopper warp specialization
-        warp_specialize=FLATTEN_LOOPS,
+        warp_specialize=FLATTEN_LOOPS and not CLC,
     ):
+        if CLC:
+            block_id = tl.program_id(0)
 
         pid_z, pid_m, pid_n, pid_k = compute_pids(block_id, useful_grid_m, grid_n, num_blocks, XCD_SWIZZLE, GROUP_M, SPLIT_K)
 
@@ -274,9 +282,10 @@ def _p_matmul(
         block_div: tl.constexpr = 2 if is_x_fp4 else 1
 
         # ---- offset x ------
+        tile_offs_m = off_m + tl.arange(0, BLOCK_M)
+        mask_m = tile_offs_m < shape_m
         if USE_GATHER_TMA:
-            offs_m = off_m + tl.arange(0, BLOCK_M)
-            mask_m = offs_m < shape_m
+            offs_m = tile_offs_m
             if XBlockSchedule is None:
                 offs_x_m = tl.load(GatherIndx + slice_off_m.to(index_type) + offs_m, mask=mask_m)
                 # Bump rows to account for the Z offset.
@@ -304,8 +313,21 @@ def _p_matmul(
             offs_k_scale = off_k_x0 // MX_BLOCK_SIZE + tl.arange(0, MX_SCALE_BLOCK_K)
             XMxScalePtrs += (offs_x_m if USE_GATHER_TMA else offs_m).to(index_type)[:, None] * stride_x_mx_m
             XMxScalePtrs += offs_k_scale.to(index_type)[None, :] * stride_x_mx_k
+        XTensorScalePtrs = None
+        if XTensorScale is not None:
+            XTensorScalePtrs = XTensorScale + off_x_z.to(index_type) * stride_x_tensor_scale_z
+            if USE_GATHER_TMA:
+                scale_offs_m = offs_x_m
+            elif X_TMA_MODE is None:
+                scale_offs_m = offs_m
+            else:
+                scale_offs_m = tile_offs_m
+            if GatherIndx is None:
+                XTensorScalePtrs += slice_off_m * stride_x_tensor_scale_m
+            XTensorScalePtrs += scale_offs_m.to(index_type) * stride_x_tensor_scale_m
 
-        acc = tl.zeros((BLOCK_N, BLOCK_M) if SWAP_XW else (BLOCK_M, BLOCK_N), dtype=tl.float32)
+        acc_dtype: tl.constexpr = tl.float64 if x_type == tl.float64 and w_type == tl.float64 else tl.float32
+        acc = tl.zeros((BLOCK_N, BLOCK_M) if SWAP_XW else (BLOCK_M, BLOCK_N), dtype=acc_dtype)
 
         # ------------------------------------------------------------
         # inner loop
@@ -444,6 +466,15 @@ def _p_matmul(
                     else:
                         tl.static_assert(x_format == "bf16")
                         acc = tl.dot(wT, x.T, acc, max_num_imprecise_acc=MAX_NUM_IMPRECISE_ACC, allow_tf32=ALLOW_TF32)
+                elif (is_w_mxfp4 and get_dtype(WMxScale) == tl.float8e4nv and not is_x_microscaled
+                      and x_format != "fp16" and x_format != "bf16"):
+                    # This fallback upcasts only local values and block scales.
+                    # Row/fiber scales are applied once after the K loop.
+                    w_dense = upcast_nvfp4_tile(w.T, w_scales, tl.bfloat16).T
+                    if SWAP_XW:
+                        acc = tl.dot_scaled(w_dense.T, None, "bf16", x.T, x_scales, x_format, acc=acc, fast_math=True)
+                    else:
+                        acc = tl.dot_scaled(x, x_scales, x_format, w_dense, None, "bf16", acc=acc, fast_math=True)
                 else:
                     if SWAP_XW:
                         acc = tl.dot_scaled(w.T, w_scales, w_format, x.T, x_scales, x_format, acc=acc, fast_math=True)
@@ -457,6 +488,25 @@ def _p_matmul(
 
             if is_x_microscaled and XMxScalePtrs is not None:
                 XMxScalePtrs += (MX_SCALE_BLOCK_K * SPLIT_K) * stride_x_mx_k
+
+        if XTensorScale is not None or WTensorScale is not None:
+            x_tensor_scales = tl.full((BLOCK_M,), 1.0, tl.float32)
+            w_tensor_scales = tl.full((BLOCK_N,), 1.0, tl.float32)
+            if XTensorScale is not None:
+                x_tensor_scales = tl.load(XTensorScalePtrs, mask=mask_m, other=0.0)
+            if WTensorScale is not None:
+                offs_w_tensor_scale_n = off_n + tl.arange(0, BLOCK_N)
+                w_tensor_scales = tl.load(
+                    WTensorScale
+                    + off_w_z.to(index_type) * stride_w_tensor_scale_e
+                    + offs_w_tensor_scale_n.to(index_type) * stride_w_tensor_scale_n,
+                    mask=offs_w_tensor_scale_n < N,
+                    other=0.0,
+                )
+            if SWAP_XW:
+                acc *= w_tensor_scales[:, None] * x_tensor_scales[None, :]
+            else:
+                acc *= x_tensor_scales[:, None] * w_tensor_scales[None, :]
 
         # ------------------------------------------------------------
         # epilogue
@@ -656,6 +706,9 @@ def _p_matmul(
                     INDEX_TYPE=index_type,
                 )
                 mask_n_scale = offs_y_n_scale < n_mx_blocks
+                if Y_MX_SCALE_LAYOUT == "BLACKWELL_ACT_SCALE" and not OUT_N_TILE_ALIGNED:
+                    out_scale = tl.where(mask_n_scale[None, :], out_scale, 0)
+                    mask_n_scale = offs_y_n_scale < tl.cdiv(n_mx_blocks, 4) * 4
                 scale_store_mask = mask_m[:, None] if OUT_N_TILE_ALIGNED else mask_m[:, None] & mask_n_scale[None, :]
                 tl.store(YActualScalePtrs, out_scale, mask=scale_store_mask)
             else:

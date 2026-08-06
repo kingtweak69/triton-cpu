@@ -30,6 +30,8 @@ namespace ttng = mlir::triton::nvidia_gpu;
 namespace {
 
 static constexpr const char kGSanGlobalStateArgAttr[] = "tti.gsan_global_state";
+static constexpr const char kGSanStreamClockArgAttr[] = "tti.gsan_stream_clock";
+static constexpr const char kGSanKernelIdArgAttr[] = "tti.gsan_kernel_id";
 static constexpr const char kDisableSetMaxRegisterAttr[] =
     "tti.disable_setmaxregister";
 
@@ -103,18 +105,6 @@ getInstrumentationEncoding(OpBuilder &builder, ArrayRef<int64_t> shape,
                                        order, base.getCGALayout());
 }
 
-static Value expandAllSlicedDims(OpBuilder &builder, Location loc,
-                                 Value tensor) {
-  auto type = cast<RankedTensorType>(tensor.getType());
-  auto sliceEncoding = dyn_cast<ttg::SliceEncodingAttr>(type.getEncoding());
-  while (sliceEncoding) {
-    tensor = expandOuterSlicedDim(builder, loc, tensor);
-    type = cast<RankedTensorType>(tensor.getType());
-    sliceEncoding = dyn_cast<ttg::SliceEncodingAttr>(type.getEncoding());
-  }
-  return tensor;
-}
-
 static DescriptorInfo getDescriptorInfo(Value desc, OpBuilder &builder) {
   if (!isa<tt::TensorDescType>(desc.getType())) {
     std::string msg;
@@ -147,15 +137,12 @@ static DescriptorInfo getDescriptorInfo(Value desc, OpBuilder &builder) {
 static Value createExpandedOffsetRange(OpBuilder &builder, Location loc,
                                        RankedTensorType fullI64Type,
                                        Value offset, unsigned dim) {
-  auto fullEncoding =
-      cast<ttg::DistributedEncodingTrait>(fullI64Type.getEncoding());
-  auto sliceEncoding = getSingleDimSliceEncoding(fullEncoding, dim);
   int64_t dimSize = fullI64Type.getShape()[dim];
 
-  auto sliceI32Type =
-      RankedTensorType::get({dimSize}, builder.getI32Type(), sliceEncoding);
-  auto sliceI64Type =
-      RankedTensorType::get({dimSize}, builder.getI64Type(), sliceEncoding);
+  auto sliceI32Type = getSlicedTensorType(fullI64Type, {static_cast<int>(dim)},
+                                          builder.getI32Type());
+  auto sliceI64Type = getSlicedTensorType(fullI64Type, {static_cast<int>(dim)},
+                                          builder.getI64Type());
 
   Value range = tt::MakeRangeOp::create(builder, loc, sliceI32Type, 0, dimSize);
   Value rangeI64 = arith::ExtSIOp::create(builder, loc, sliceI64Type, range);
@@ -164,26 +151,17 @@ static Value createExpandedOffsetRange(OpBuilder &builder, Location loc,
       tt::SplatOp::create(builder, loc, sliceI64Type, offsetI64);
   Value result =
       arith::AddIOp::create(builder, loc, sliceI64Type, offsetSplat, rangeI64);
-  result = expandAllSlicedDims(builder, loc, result);
-  if (cast<RankedTensorType>(result.getType()).getShape() !=
-      fullI64Type.getShape()) {
-    result = tt::BroadcastOp::create(builder, loc, fullI64Type, result);
-  }
-  return result;
+  return reshapeAndBroadcast(builder, loc, result, {static_cast<int>(dim)},
+                             fullI64Type);
 }
 
 static Value convertAndBroadcast(OpBuilder &builder, Location loc, Value tensor,
                                  int dim, RankedTensorType dstType) {
   auto tensorType = cast<RankedTensorType>(tensor.getType());
-  auto encoding = cast<ttg::DistributedEncodingTrait>(dstType.getEncoding());
-  auto sliceEncoding = getSingleDimSliceEncoding(encoding, dim);
-  auto sliceType = RankedTensorType::get(
-      tensorType.getShape(), tensorType.getElementType(), sliceEncoding);
+  auto sliceType =
+      getSlicedTensorType(dstType, {dim}, tensorType.getElementType());
   tensor = ttg::ConvertLayoutOp::create(builder, loc, sliceType, tensor);
-  tensor = expandAllSlicedDims(builder, loc, tensor);
-  if (cast<RankedTensorType>(tensor.getType()).getShape() != dstType.getShape())
-    tensor = tt::BroadcastOp::create(builder, loc, dstType, tensor);
-  return tensor;
+  return reshapeAndBroadcast(builder, loc, tensor, {dim}, dstType);
 }
 
 static Value createMaskFromRanges(OpBuilder &builder, Location loc,
@@ -293,20 +271,20 @@ static void instrumentAsyncTMALoad(ttng::AsyncTMACopyGlobalToLocalOp op) {
 
   OpBuilder builder(op);
   auto desc = getDescriptorInfo(op.getDesc(), builder);
+  auto blockShape = op.getDesc().getType().getShape();
 
   auto offsets = castToI64(builder, op.getLoc(), op.getCoord());
-  auto access = createTiledAccess(builder, op.getLoc(), desc,
-                                  op.getResult().getType().getShape(), offsets,
-                                  op.getPred());
+  auto access = createTiledAccess(builder, op.getLoc(), desc, blockShape,
+                                  offsets, op.getPred());
   ExperimentalGSanTensorAccessOp::create(builder, op.getLoc(), access.first,
                                          access.second, /*isStore=*/false);
 }
 
 static void instrumentAsyncTMAStore(Operation *op, Value descValue,
-                                    ArrayRef<int64_t> blockShape,
                                     ValueRange coords) {
   OpBuilder builder(op);
   auto desc = getDescriptorInfo(descValue, builder);
+  auto blockShape = cast<tt::TensorDescType>(descValue.getType()).getShape();
 
   auto offsets = castToI64(builder, op->getLoc(), coords);
   auto access = createTiledAccess(builder, op->getLoc(), desc, blockShape,
@@ -318,14 +296,26 @@ static void instrumentAsyncTMAStore(Operation *op, Value descValue,
 static void instrumentAsyncTMAReduce(ttng::AsyncTMAReduceOp op) {
   OpBuilder builder(op);
   auto desc = getDescriptorInfo(op.getDesc(), builder);
+  auto blockShape = op.getDesc().getType().getShape();
 
   auto offsets = castToI64(builder, op.getLoc(), op.getCoord());
-  auto access = createTiledAccess(builder, op.getLoc(), desc,
-                                  op.getSrc().getType().getShape(), offsets,
-                                  std::nullopt);
+  auto access = createTiledAccess(builder, op.getLoc(), desc, blockShape,
+                                  offsets, std::nullopt);
   ExperimentalGSanAtomicTensorAccessOp::create(
       builder, op.getLoc(), access.first, access.second, MemSemantic::RELAXED,
       MemSyncScope::GPU);
+}
+
+static void instrumentAtomicPoll(tt::AtomicPollOp op) {
+  OpBuilder builder(op);
+  builder.setInsertionPointAfter(op);
+  ExperimentalGSanAtomicPollOp::create(builder, op.getLoc(), op.getPtr(),
+                                       op.getResult(), op.getSem(),
+                                       op.getScope());
+  if (ttg::lookupNumCTAs(op) == 1)
+    ttg::BarrierOp::create(builder, op.getLoc(), ttg::AddrSpace::Local);
+  else
+    ttng::ClusterBarrierOp::create(builder, op.getLoc());
 }
 
 static void instrumentAsyncTMAGather(ttng::AsyncTMAGatherOp op) {
@@ -355,6 +345,26 @@ static void instrumentAsyncTMAScatter(ttng::AsyncTMAScatterOp op) {
                                          access.second, /*isStore=*/true);
 }
 
+static Value getGSanStateForCall(tt::CallOp callOp, Value gsanState) {
+  auto partitions = callOp->getParentOfType<ttg::WarpSpecializePartitionsOp>();
+  if (!partitions)
+    return gsanState;
+
+  auto captures = partitions.getExplicitCaptures();
+  auto capture = llvm::find(captures, gsanState);
+  unsigned captureIdx = std::distance(captures.begin(), capture);
+  if (capture == captures.end()) {
+    partitions->insertOperands(captureIdx, gsanState);
+    for (Region &region : partitions.getPartitionRegions())
+      region.addArgument(gsanState.getType(), callOp.getLoc());
+  }
+
+  Region *partitionRegion = callOp->getParentRegion();
+  while (partitionRegion->getParentOp() != partitions.getOperation())
+    partitionRegion = partitionRegion->getParentRegion();
+  return partitionRegion->getArgument(captureIdx);
+}
+
 class GlobalSanitizerPass
     : public impl::TritonInstrumentGlobalSanitizerBase<GlobalSanitizerPass> {
 public:
@@ -362,6 +372,10 @@ public:
     ModuleOp module = getOperation();
     OpBuilder builder(module);
     Type gsanStatePtrTy = tt::PointerType::get(builder.getI8Type(), 1);
+    Type streamClockPtrTy = tt::PointerType::get(builder.getI32Type(), 1);
+    Type kernelIdTy = builder.getI64Type();
+    auto launchPdl = module->getAttrOfType<IntegerAttr>("tti.gsan_launch_pdl");
+    bool acquireStreamClock = !launchPdl || launchPdl.getInt() == 0;
     DenseSet<StringRef> calledFuncs;
     module.walk(
         [&](tt::CallOp callOp) { calledFuncs.insert(callOp.getCallee()); });
@@ -373,10 +387,14 @@ public:
       SmallVector<Type> inputTys(funcTy.getInputs().begin(),
                                  funcTy.getInputs().end());
       inputTys.push_back(gsanStatePtrTy);
+      inputTys.push_back(streamClockPtrTy);
+      inputTys.push_back(kernelIdTy);
       func.setType(FunctionType::get(module.getContext(), inputTys,
                                      funcTy.getResults()));
 
       func.getBody().addArgument(gsanStatePtrTy, func.getLoc());
+      func.getBody().addArgument(streamClockPtrTy, func.getLoc());
+      func.getBody().addArgument(kernelIdTy, func.getLoc());
       SmallVector<Attribute> newArgAttrs;
       if (auto argAttrs = func.getAllArgAttrs())
         newArgAttrs.append(argAttrs.begin(), argAttrs.end());
@@ -385,13 +403,22 @@ public:
       }
       if (!newArgAttrs.empty())
         func.setAllArgAttrs(newArgAttrs);
-      func.setArgAttr(func.getNumArguments() - 1, kGSanGlobalStateArgAttr,
+      func.setArgAttr(func.getNumArguments() - 3, kGSanGlobalStateArgAttr,
+                      builder.getUnitAttr());
+      func.setArgAttr(func.getNumArguments() - 2, kGSanStreamClockArgAttr,
+                      builder.getUnitAttr());
+      func.setArgAttr(func.getNumArguments() - 1, kGSanKernelIdArgAttr,
                       builder.getUnitAttr());
 
       bool isEntry = !calledFuncs.contains(func.getSymName());
       if (isEntry) {
         OpBuilder b(&func.front(), func.front().begin());
-        ExperimentalGSanInitOp::create(b, func.getLoc());
+        ExperimentalGSanInitOp::create(b, func.getLoc(), acquireStreamClock);
+        func.walk([&](tt::ReturnOp returnOp) {
+          OpBuilder returnBuilder(returnOp);
+          ExperimentalGSanKernelExitOp::create(returnBuilder,
+                                               returnOp.getLoc());
+        });
       }
     }
 
@@ -399,12 +426,17 @@ public:
     module.walk([&](tt::CallOp op) { callOps.push_back(op); });
     for (tt::CallOp callOp : callOps) {
       auto caller = callOp->getParentOfType<tt::FuncOp>();
-      assert(caller && caller.getNumArguments() > 0 &&
+      assert(caller && caller.getNumArguments() >= 3 &&
              "expected triton.call to be nested under a Triton function");
 
       SmallVector<Value> operands(callOp.getOperands().begin(),
                                   callOp.getOperands().end());
-      operands.push_back(caller.getArgument(caller.getNumArguments() - 1));
+      Value gsanState = caller.getArgument(caller.getNumArguments() - 3);
+      Value streamClock = caller.getArgument(caller.getNumArguments() - 2);
+      Value kernelId = caller.getArgument(caller.getNumArguments() - 1);
+      operands.push_back(getGSanStateForCall(callOp, gsanState));
+      operands.push_back(getGSanStateForCall(callOp, streamClock));
+      operands.push_back(getGSanStateForCall(callOp, kernelId));
 
       OpBuilder b(callOp);
       auto newCallOp =
@@ -436,9 +468,7 @@ public:
           .Case(
               [&](ttng::AsyncTMAGatherOp op) { instrumentAsyncTMAGather(op); })
           .Case([&](ttng::AsyncTMACopyLocalToGlobalOp op) {
-            instrumentAsyncTMAStore(op, op.getDesc(),
-                                    op.getSrc().getType().getShape(),
-                                    op.getCoord());
+            instrumentAsyncTMAStore(op, op.getDesc(), op.getCoord());
           })
           .Case(
               [&](ttng::AsyncTMAReduceOp op) { instrumentAsyncTMAReduce(op); })
@@ -458,6 +488,11 @@ public:
                 op.getVal(), op.getSem(), op.getScope());
             newOp->setAttrs(op->getAttrs());
             b.replaceOp(op, newOp);
+          })
+          .Case([&](tt::AtomicPollOp op) { instrumentAtomicPoll(op); })
+          .Case([&](tt::GridDependencyWaitOp op) {
+            b.setInsertionPointAfter(op);
+            ExperimentalGSanGridDependencyWaitOp::create(b, op.getLoc());
           })
           .Case([&](ttg::WarpSpecializeOp op) {
             op->setAttr(kDisableSetMaxRegisterAttr, builder.getUnitAttr());

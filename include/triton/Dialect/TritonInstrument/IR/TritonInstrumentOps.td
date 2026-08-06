@@ -3,6 +3,7 @@
 
 include "triton/Dialect/TritonInstrument/IR/TritonInstrumentDialect.td"
 include "triton/Dialect/TritonGPU/IR/TritonGPUTypes.td"
+include "triton/Dialect/TritonGPU/IR/TritonGPUMemoryEffects.td"
 include "triton/Dialect/Triton/IR/TritonTypes.td"
 include "triton/Dialect/Triton/IR/TritonInterfaces.td"
 include "triton/Dialect/Triton/IR/TritonOpInterfaces.td"
@@ -20,8 +21,8 @@ def GlobalMemory : Resource<"::mlir::triton::GlobalMemory">;
 // Ops
 //
 
-class TTI_Op<string mnemonic, list<Trait> traits = []> :
-    Op<TritonInstrument_Dialect, mnemonic, traits> {
+class TTI_Op<string mnemonic, list<Trait> traits = []>
+    : Op<TritonInstrument_Dialect, mnemonic, traits> {
 }
 
 def TTI_ExperimentalAssertUniformOp : TTI_Op<"experimental_assert_uniform", [MemoryEffects<[MemWrite<GlobalMemory>]>]> {
@@ -62,6 +63,20 @@ def TTI_ExperimentalMemDescToI32Op : TTI_Op<"experimental_memdesc_to_i32", [Pure
   let assemblyFormat = "$memdesc attr-dict `:` type($memdesc)";
 }
 
+def TTI_ExperimentalMemoryOffsetToI32Op
+    : TTI_Op<"experimental_memory_offset_to_i32", [Pure]> {
+  let summary = "Materialize a memory-space offset as an i32 address";
+  let description = [{
+    Add a static byte or encoded tensor-memory offset to the current
+    function's memory-space base and return the 32-bit address used by ConSan.
+    This provides the runtime identity corresponding to a compile-time
+    BufferRegion key without materializing a descriptor table.
+  }];
+  let arguments = (ins I32Attr:$offset, TT_MemTypeAttr:$memType);
+  let results = (outs I32:$result);
+  let assemblyFormat = "$offset `,` $memType attr-dict";
+}
+
 def TTI_ExperimentalClusterCTAIdOp
     : TTI_Op<"experimental_cluster_cta_id", [Pure]> {
   let summary = "Get the CTA id within the current cluster";
@@ -78,10 +93,48 @@ def TTI_ExperimentalClusterCTAIdOp
   let assemblyFormat = "attr-dict `:` type($result)";
 }
 
+def TTI_ExperimentalLocalGatherOp
+    : TTI_Op<"experimental_local_gather"> {
+  let summary = "Gather elements from shared memory with logical base offsets";
+  let description = [{
+    Gather elements from a shared memory descriptor using an index tensor along
+    one axis, after shifting the logical source coordinates by rank-sized scalar
+    offsets. This is intentionally private to instrumentation passes.
+  }];
+  let arguments = (ins
+    Arg<TTG_MemDescType, "", GenericSharedRead>:$src,
+    TT_IntTensor:$indices,
+    Variadic<I32>:$offsets,
+    I32Attr:$axis
+  );
+  let results = (outs TT_Tensor:$result);
+
+  let assemblyFormat = [{
+    $src `[` $indices `]` `offsets` `=` `[` $offsets `]`
+    attr-dict `:` qualified(type($src)) `,` type($indices) `->` type($result)
+  }];
+  let hasVerifier = 1;
+}
+
 def TTI_ExperimentalGSanInitOp
     : TTI_Op<"experimental_gsan_init"> {
   let summary = "Initialize GSan thread";
+  let arguments = (ins BoolAttr:$acquireStreamClock);
+  let assemblyFormat = "$acquireStreamClock attr-dict";
+}
+
+def TTI_ExperimentalGSanKernelExitOp
+    : TTI_Op<"experimental_gsan_kernel_exit", [MemoryEffects<[MemWrite<GlobalMemory>]>]> {
+  let summary = "Publish a completed GSan thread clock to its launch stream";
   let arguments = (ins);
+  let assemblyFormat = "attr-dict";
+}
+
+def TTI_ExperimentalGSanGridDependencyWaitOp
+    : TTI_Op<"experimental_gsan_grid_dependency_wait", [MemoryEffects<[MemRead<GlobalMemory>, MemWrite<GlobalMemory>]>]> {
+  let summary = "Acquire completed predecessor clocks after a grid dependency wait";
+  let arguments = (ins);
+  let assemblyFormat = "attr-dict";
 }
 
 def TTI_ExperimentalGSanTensorDescInfoOp
@@ -132,7 +185,26 @@ def TTI_ExperimentalGSanAtomicTensorAccessOp
   }];
 }
 
+def TTI_ExperimentalGSanAtomicPollOp
+    : TTI_Op<"experimental_gsan_atomic_poll"> {
+  let summary = "Instrument a completed atomic poll for GSan";
+  let description = [{
+    Records the successful read performed by an atomic poll after the hardware
+    polling loop has completed.
+  }];
+  let arguments = (ins
+    Arg<TT_Ptr, "", [MemRead<GlobalMemory>, MemWrite<GlobalMemory>]>:$ptr,
+    I1:$matched,
+    TT_MemSemanticAttr:$sem,
+    TT_MemSyncScopeAttr:$scope
+  );
+  let assemblyFormat = [{
+    $sem `,` $scope `,` $ptr `,` $matched attr-dict `:` qualified(type($ptr))
+  }];
+}
+
 def TTI_ExperimentalGSanAtomicRMWOp : TTI_Op<"experimental_gsan_atomic_rmw", [
+  AtomicOpInterface,
   SameOperandsAndResultShape,
   SameOperandsAndResultEncoding,
   TypesMatchWith<"ptr type matches value type", "val", "ptr",
@@ -158,6 +230,7 @@ def TTI_ExperimentalGSanAtomicRMWOp : TTI_Op<"experimental_gsan_atomic_rmw", [
 }
 
 def TTI_ExperimentalGSanAtomicCASOp : TTI_Op<"experimental_gsan_atomic_cas", [
+  AtomicOpInterface,
   SameOperandsAndResultShape,
   SameOperandsAndResultEncoding,
   TypesMatchWith<"ptr type matches cmp type", "cmp", "ptr",
