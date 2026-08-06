@@ -448,7 +448,8 @@ translateLLVMIRToASM(llvm::Module &module, const std::string &triple,
   // Set up target information before inlining so target-specific inline
   // compatibility checks use the backend's TTI.
   module.setTargetTriple(Triple(triple));
-  auto machine = createTargetMachine(&module, proc, enable_fp_fusion, features);
+  auto machine = createTargetMachine(&module, proc, enable_fp_fusion, features,
+                                     enable_fast_math);
   module.setDataLayout(machine->createDataLayout());
 
   // inline everything
@@ -479,15 +480,6 @@ translateLLVMIRToASM(llvm::Module &module, const std::string &triple,
     timePassesStr.clear();
   }
 
-<<<<<<< HEAD
-  // create machine
-  module.setTargetTriple(Triple(triple));
-  auto machine = createTargetMachine(&module, proc, enable_fp_fusion, features,
-                                     enable_fast_math);
-  // set data layout
-  module.setDataLayout(machine->createDataLayout());
-=======
->>>>>>> upstream/main
   if (canonicalizeGEP && !disableLLVMOpt) {
     // The NVPTX pipeline otherwise exposes many equivalent GEPs to SLSR
     // without eliminating them first.
@@ -916,7 +908,6 @@ void init_triton_llvm(py::module_ &m) {
       py::arg("expand_masked_div_rem") = false,
       py::call_guard<py::gil_scoped_release>());
 
-<<<<<<< HEAD
   m.def("set_host_target", [](llvm::Module *mod) {
     auto triple = getDefaultTargerOrProcessTriple();
     mod->setTargetTriple(Triple(triple));
@@ -1009,38 +1000,16 @@ void init_triton_llvm(py::module_ &m) {
             llvm::report_fatal_error(
                 "failed to parse IR: " + error.getMessage() +
                 "lineno: " + std::to_string(error.getLineNo()));
-=======
-  m.def("translate_to_asm",
-        [](std::string llvmIR, std::string triple, std::string proc,
-           std::string features, std::vector<std::string> flags,
-           bool enable_fp_fusion, bool isObject,
-           bool canonicalizeGEP) -> py::object {
-          std::string obj;
-          {
-            // when allow_threads goes out of scope, gil will be released
-            py::gil_scoped_release allow_threads;
-            // create LLVM module from C++
-            llvm::LLVMContext context;
-            std::unique_ptr<llvm::MemoryBuffer> buffer =
-                llvm::MemoryBuffer::getMemBuffer(llvmIR.c_str());
-            llvm::SMDiagnostic error;
-            std::unique_ptr<llvm::Module> module =
-                llvm::parseIR(buffer->getMemBufferRef(), error, context);
-            if (!module) {
-              llvm::report_fatal_error(
-                  "failed to parse IR: " + error.getMessage() +
-                  "lineno: " + std::to_string(error.getLineNo()));
-            }
-            obj = translateLLVMIRToASM(*module, triple, proc, features, flags,
-                                       enable_fp_fusion, isObject,
-                                       canonicalizeGEP);
->>>>>>> upstream/main
           }
-          if (isObject)
-            return py::object(py::bytes(obj.c_str(), obj.size()));
-          else
-            return py::object(py::str(obj.c_str(), obj.size()));
-        });
+          obj = translateLLVMIRToASM(*module, triple, proc, features, flags,
+                                     enable_fp_fusion, isObject,
+                                     canonicalizeGEP);
+        }
+        if (isObject)
+          return py::object(py::bytes(obj.c_str(), obj.size()));
+        else
+          return py::object(py::str(obj.c_str(), obj.size()));
+      });
 
   m.def("dump_sched_dag", [](std::string llvmIR, std::string triple,
                              std::string proc, std::string features,

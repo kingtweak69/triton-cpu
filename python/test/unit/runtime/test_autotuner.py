@@ -6,11 +6,7 @@ import pytest
 
 import pathlib
 import uuid
-<<<<<<< HEAD
-from triton._internal_testing import is_cuda, is_hip_cdna, is_cpu
-=======
-from triton._internal_testing import is_cuda, is_hip_cdna2, is_rubin
->>>>>>> upstream/main
+from triton._internal_testing import is_cuda, is_hip_cdna, is_hip_cdna2, is_rubin, is_cpu
 
 
 def do_bench(kernel_call, quantiles, use_cuda_graph=False):

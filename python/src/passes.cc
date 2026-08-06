@@ -146,25 +146,19 @@ void init_plugin_passes(py::module_ &m) {
       "functions for each pass.");
 }
 
-<<<<<<< HEAD
-void init_triton_passes_ttcpuir(py::module &&m) {}
+void init_triton_passes_ttcpuir(py::module_ &m) {}
 
-void init_triton_passes_convert(py::module &&m) {
-=======
 void init_triton_passes_convert(py::module_ &m) {
->>>>>>> upstream/main
   using namespace mlir;
   ADD_PASS_WRAPPER_0("add_scf_to_cf", createSCFToControlFlowPass);
   ADD_PASS_WRAPPER_0("add_cf_to_llvmir", createConvertControlFlowToLLVMPass);
   ADD_PASS_WRAPPER_0("add_index_to_llvmir", createConvertIndexToLLVMPass);
   ADD_PASS_WRAPPER_0("add_arith_to_llvmir", createArithToLLVMConversionPass);
   ADD_PASS_WRAPPER_0("add_nvvm_to_llvm", createConvertNVVMToLLVMPass);
-<<<<<<< HEAD
   ADD_PASS_WRAPPER_0("add_math_to_llvmir", createConvertMathToLLVMPass);
   ADD_PASS_WRAPPER_0("add_reconcile_unrealized",
-=======
+                     createReconcileUnrealizedCastsPass);
   ADD_PASS_WRAPPER_0("add_reconcile_unrealized_casts",
->>>>>>> upstream/main
                      createReconcileUnrealizedCastsPass);
 }
 
@@ -187,18 +181,6 @@ void init_gluon_passes(py::module_ &m) {
 
 } // namespace
 
-<<<<<<< HEAD
-void init_triton_passes(py::module &&m) {
-  init_triton_analysis(m.def_submodule("analysis"));
-  init_triton_passes_common(m.def_submodule("common"));
-  init_triton_passes_convert(m.def_submodule("convert"));
-  init_triton_passes_ttir(m.def_submodule("ttir"));
-  init_triton_passes_ttcpuir(m.def_submodule("ttcpuir"));
-  init_triton_passes_ttgpuir(m.def_submodule("ttgpuir"));
-  init_triton_passes_llvmir(m.def_submodule("llvmir"));
-  init_gluon_passes(m.def_submodule("gluon"));
-  init_plugin_passes(m.def_submodule("plugin"));
-=======
 void init_triton_passes(py::module_ &m) {
   auto analysis_m = m.def_submodule("analysis");
   init_triton_analysis(analysis_m);
@@ -208,6 +190,8 @@ void init_triton_passes(py::module_ &m) {
   init_triton_passes_convert(convert_m);
   auto ttir_m = m.def_submodule("ttir");
   init_triton_passes_ttir(ttir_m);
+  auto ttcpuir_m = m.def_submodule("ttcpuir");
+  init_triton_passes_ttcpuir(ttcpuir_m);
   auto ttgpuir_m = m.def_submodule("ttgpuir");
   init_triton_passes_ttgpuir(ttgpuir_m);
   auto llvmir_m = m.def_submodule("llvmir");
@@ -216,5 +200,4 @@ void init_triton_passes(py::module_ &m) {
   init_gluon_passes(gluon_m);
   auto plugin_m = m.def_submodule("plugin");
   init_plugin_passes(plugin_m);
->>>>>>> upstream/main
 }

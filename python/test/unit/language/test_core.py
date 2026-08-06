@@ -1568,9 +1568,6 @@ def test_noinline_returns_tensor(device):
 # ---------------
 # test atomics
 # ---------------
-<<<<<<< HEAD
-@pytest.mark.cpu
-=======
 
 
 @pytest.mark.interpreter
@@ -1655,7 +1652,7 @@ def test_atomic_poll_waits_for_remote_cta(device):
     assert out.item() == 42
 
 
->>>>>>> upstream/main
+@pytest.mark.cpu
 @pytest.mark.interpreter
 @pytest.mark.parametrize(
     "op, dtype_x_str, mode, sem",
@@ -5552,7 +5549,6 @@ def test_tma_store_block_shape_err(device):
     assert "Descriptor block shape must have at least 16 bytes" in str(e.value.__cause__)
 
 
-<<<<<<< HEAD
 def test_trans_reshape(device, with_allocator):
 
     @triton.jit
@@ -5586,8 +5582,6 @@ def test_trans_reshape(device, with_allocator):
     np.testing.assert_equal(to_numpy(expected), to_numpy(actual))
 
 
-=======
->>>>>>> upstream/main
 # -------------
 # test call
 # -------------

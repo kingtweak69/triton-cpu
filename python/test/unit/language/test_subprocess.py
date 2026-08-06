@@ -55,23 +55,13 @@ def _hex_float_values(output: bytes) -> Counter:
                                                       ("device_print_uint_cast", "uint8"),
                                                       ("device_print_2d_tensor", "int32"),
                                                   ])
-<<<<<<< HEAD
-def test_print(func_type: str, data_type: str, device: str):
+def test_print(func_type: str, data_type: str, device: str, capfd):
     if is_cpu() and (data_type == "float16" or func_type in ["device_print_pointer", "device_print_large"]):
         pytest.skip("test_print for float16/pointer/large are not yet supported on CPU.")
 
-    proc = subprocess.run(
-        [sys.executable, print_path, "test_print", func_type, data_type, device],
-        capture_output=True,
-        env={**os.environ, "TRITON_CPU_BACKEND": "1" if is_cpu() else "0"},
-    )
-    assert proc.returncode == 0
-=======
-def test_print(func_type: str, data_type: str, device: str, capfd):
     print_helper.test_print(func_type, data_type, device)
     output = capfd.readouterr()
     stdout = output.out.encode("utf-8")
->>>>>>> upstream/main
 
     # The total number of elements in the 1-D tensor to print.
     N = 128
@@ -101,7 +91,7 @@ def test_print(func_type: str, data_type: str, device: str, capfd):
 
     # TODO: Consider cases for signedness, overflow, and multiple pids (non-determinism).
     if is_cpu():
-        _check_cpu_print(proc.stdout.decode("UTF-8"), func_type, data_type, N, SCALAR_VAL)
+        _check_cpu_print(output.out, func_type, data_type, N, SCALAR_VAL)
         return
 
     # Format is

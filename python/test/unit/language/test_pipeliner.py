@@ -546,10 +546,6 @@ def matmul_kernel_persistent_scatter(a_ptr, b_ptr, c_ptr,  #
         c_desc.scatter(c, offs_am + tl.arange(0, BLOCK_SIZE_M), offs_bn)
 
 
-<<<<<<< HEAD
-@pytest.mark.skipif(not is_cuda() or torch.cuda.get_device_capability()[0] != 10,
-                    reason="TMA Scatter only works on cloud Blackwell Chips")
-=======
 def _supports_descriptor_scatter():
     if is_cuda():
         return torch.cuda.get_device_capability()[0] == 10
@@ -558,7 +554,6 @@ def _supports_descriptor_scatter():
 
 @pytest.mark.skipif(not _supports_descriptor_scatter(),
                     reason="TMA/TDM Scatter only works on cloud Blackwell Chips or AMD gfx1250")
->>>>>>> upstream/main
 def test_scatter_pipeline(device):
 
     def alloc_fn(size, alignment, stream):
